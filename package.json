@@ -1,0 +1,11 @@
+{
+  "name": "awc-api-proxy-ibm-code-engine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "IBM Code Engine proxy for AWC raw METAR API with tgftp-style station routes",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs"
+  }
+}
