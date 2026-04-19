@@ -6,8 +6,9 @@ Public routes:
 
 - `/healthz`
 - `/stations/<ICAO>.TXT`
+- `/tgftp/stations/<ICAO>.TXT`
 
-Behavior:
+Behavior for `/stations/<ICAO>.TXT`:
 
 - fetches `https://aviationweather.gov/api/data/metar`
 - tries `format=raw` first
@@ -15,6 +16,12 @@ Behavior:
 - reshapes successful station responses into the tgftp-style two-line body:
   - `YYYY/MM/DD HH:MM`
   - `METAR ...`
+
+Behavior for `/tgftp/stations/<ICAO>.TXT`:
+
+- fetches `https://tgftp.nws.noaa.gov/data/observations/metar/stations/<ICAO>.TXT`
+- returns the upstream station TXT body directly
+- sets `X-Upstream-Source: tgftp-station-txt`
 
 ## Files
 

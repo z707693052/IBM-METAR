@@ -1,6 +1,7 @@
 import http from "node:http";
 
 const AWC_API_BASE = "https://aviationweather.gov/api/data/metar";
+const TGFTP_BASE_URL = "https://tgftp.nws.noaa.gov/data/observations/metar/stations";
 const DEFAULT_USER_AGENT = "weather_app/1.0 (github.com/weather-arb-dev)";
 
 function jsonHeaders(extra = {}) {
@@ -31,9 +32,14 @@ function textResponse(body, init = {}) {
   });
 }
 
-function extractStationFromPath(pathname) {
-  const match = pathname.match(/^\/stations\/([A-Za-z0-9]{4})\.TXT$/);
-  return match ? match[1].toUpperCase() : null;
+function extractStationRequest(pathname) {
+  const match = pathname.match(/^\/(?:(tgftp)\/)?stations\/([A-Za-z0-9]{4})\.TXT$/);
+  if (!match) return null;
+
+  return {
+    upstream: match[1] === "tgftp" ? "tgftp" : "awc",
+    station: match[2].toUpperCase(),
+  };
 }
 
 function formatHeaderTime(date) {
@@ -75,6 +81,22 @@ function parseMetarObservationTime(rawText, now = new Date()) {
   return candidates[0];
 }
 
+function parseHeaderObservationTime(headerLine) {
+  const match = String(headerLine || "").trim().match(/^(\d{4})\/(\d{2})\/(\d{2}) (\d{2}):(\d{2})$/);
+  if (!match) return null;
+
+  const [, yearText, monthText, dayText, hourText, minuteText] = match;
+  const date = new Date(Date.UTC(
+    Number(yearText),
+    Number(monthText) - 1,
+    Number(dayText),
+    Number(hourText),
+    Number(minuteText),
+  ));
+
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 function firstMetarLine(bodyText) {
   return String(bodyText || "")
     .split(/\r?\n/)
@@ -89,6 +111,43 @@ function extractFallbackMetarFromJsonBody(bodyText) {
   const payload = JSON.parse(trimmed);
   const rows = Array.isArray(payload) ? payload : [];
   return rows.map((row) => String(row?.rawOb || "").trim()).find(Boolean) || null;
+}
+
+function extractStationTxtPayload(bodyText) {
+  const lines = String(bodyText || "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+
+  if (lines.length === 0) {
+    return {
+      headerLine: null,
+      metarLine: null,
+      bodyText: "",
+    };
+  }
+
+  if (lines.length === 1) {
+    const metarLine = lines[0].trim();
+    return {
+      headerLine: null,
+      metarLine,
+      bodyText: metarLine,
+    };
+  }
+
+  const headerLine = lines[0].trim();
+  const metarLine = lines
+    .slice(1)
+    .map((line) => line.trim())
+    .find(Boolean) || null;
+
+  return {
+    headerLine,
+    metarLine,
+    bodyText: metarLine ? `${headerLine}\n${metarLine}` : headerLine,
+  };
 }
 
 async function fetchAwc(station, format) {
@@ -133,6 +192,32 @@ async function fetchAwcMetar(station) {
   };
 }
 
+async function fetchTgftpMetar(station) {
+  const baseUrl = (process.env.TGFTP_BASE_URL || TGFTP_BASE_URL).replace(/\/+$/, "");
+  const upstreamUrl = `${baseUrl}/${station}.TXT`;
+
+  const response = await fetch(upstreamUrl, {
+    headers: {
+      "User-Agent": process.env.UPSTREAM_USER_AGENT || DEFAULT_USER_AGENT,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`TGFTP returned ${response.status}`);
+  }
+
+  const rawBody = await response.text();
+  const { headerLine, metarLine, bodyText } = extractStationTxtPayload(rawBody);
+  const observationDate = parseHeaderObservationTime(headerLine) || parseMetarObservationTime(metarLine || bodyText);
+
+  return {
+    bodyText,
+    metarLine,
+    observationDate,
+    upstreamSource: "tgftp-station-txt",
+  };
+}
+
 async function handleRequest(request) {
   const url = new URL(request.url);
 
@@ -148,18 +233,41 @@ async function handleRequest(request) {
     });
   }
 
-  const station = extractStationFromPath(url.pathname);
-  if (!station) {
+  const stationRequest = extractStationRequest(url.pathname);
+  if (!stationRequest) {
     return jsonResponse(
       {
         ok: false,
-        error: "Use /stations/<ICAO>.TXT, for example /stations/KDEN.TXT",
+        error: "Use /stations/<ICAO>.TXT or /tgftp/stations/<ICAO>.TXT, for example /tgftp/stations/KDEN.TXT",
       },
       { status: 404 },
     );
   }
 
+  const { station, upstream } = stationRequest;
+
   try {
+    if (upstream === "tgftp") {
+      const { bodyText, metarLine, observationDate, upstreamSource } = await fetchTgftpMetar(station);
+      if (!metarLine) {
+        return textResponse(`No METAR found for station ${station}`, { status: 404 });
+      }
+
+      const headers = {
+        "Cache-Control": "no-store",
+        "X-Upstream-Source": upstreamSource,
+      };
+      if (observationDate) {
+        headers["Last-Modified"] = observationDate.toUTCString();
+      }
+
+      if (request.method === "HEAD") {
+        return textResponse("", { status: 200, headers });
+      }
+
+      return textResponse(bodyText, { status: 200, headers });
+    }
+
     const { metarLine, upstreamSource } = await fetchAwcMetar(station);
     if (!metarLine) {
       return textResponse(`No METAR found for station ${station}`, { status: 404 });
